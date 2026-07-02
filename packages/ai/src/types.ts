@@ -349,6 +349,38 @@ export interface ToolCall {
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 }
 
+/**
+ * Anthropic server-managed tool call (e.g. web_search, code_execution).
+ * Captured verbatim so it can be replayed without modification.
+ * Only valid for the same provider/api/model — drop on cross-model handoff.
+ */
+export interface ServerToolUse {
+	type: "serverToolUse";
+	id: string;
+	name: string;
+	arguments: Record<string, unknown>;
+	/**
+	 * Provider-specific caller metadata (e.g. Anthropic's `caller` field when a
+	 * server tool such as web_search is invoked via code_execution). Preserved
+	 * verbatim so the assistant turn round-trips identically on replay; otherwise
+	 * the thinking-block signature no longer validates and the API rejects it.
+	 */
+	caller?: unknown;
+}
+
+/**
+ * Result block returned by an Anthropic server tool (web_search_tool_result,
+ * code_execution_tool_result). The entire content_block payload from the SSE
+ * stream is stored as `raw` and replayed verbatim.
+ * Only valid for the same provider/api/model — drop on cross-model handoff.
+ */
+export interface ServerToolResult {
+	type: "serverToolResult";
+	resultType: "web_search_tool_result" | "code_execution_tool_result";
+	toolUseId: string;
+	raw: unknown;
+}
+
 export interface Usage {
 	input: number;
 	output: number;

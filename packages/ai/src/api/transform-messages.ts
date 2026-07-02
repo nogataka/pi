@@ -4,7 +4,10 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ServerToolResult,
+	ServerToolUse,
 	TextContent,
+	ThinkingContent,
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
@@ -94,22 +97,27 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.api === model.api &&
 				assistantMsg.model === model.id;
 
-			const transformedContent = assistantMsg.content.flatMap((block) => {
+			// Cast to any[] to allow provider-specific blocks (serverToolUse /
+			// serverToolResult) that are stored at runtime but are not part of the
+			// public AssistantMessage content union.
+			const rawContent = assistantMsg.content as unknown[];
+			const transformedContent = rawContent.flatMap((rawBlock) => {
+				const block = rawBlock as TextContent | ThinkingContent | ToolCall | ServerToolUse | ServerToolResult;
 				if (block.type === "thinking") {
 					// Redacted thinking is opaque encrypted content, only valid for the same model.
 					// Drop it for cross-model to avoid API errors.
-					if (block.redacted) {
+					if ((block as ThinkingContent).redacted) {
 						return isSameModel ? block : [];
 					}
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
-					if (isSameModel && block.thinkingSignature) return block;
+					if (isSameModel && (block as ThinkingContent).thinkingSignature) return block;
 					// Skip empty thinking blocks, convert others to plain text
-					if (!block.thinking || block.thinking.trim() === "") return [];
+					if (!(block as ThinkingContent).thinking || (block as ThinkingContent).thinking.trim() === "") return [];
 					if (isSameModel) return block;
 					return {
 						type: "text" as const,
-						text: block.thinking,
+						text: (block as ThinkingContent).thinking,
 					};
 				}
 
@@ -117,7 +125,7 @@ export function transformMessages<TApi extends Api>(
 					if (isSameModel) return block;
 					return {
 						type: "text" as const,
-						text: block.text,
+						text: (block as TextContent).text,
 					};
 				}
 
@@ -141,12 +149,19 @@ export function transformMessages<TApi extends Api>(
 					return normalizedToolCall;
 				}
 
+				// serverToolUse / serverToolResult: only valid for replay on the same
+				// provider/api/model. Drop on cross-model handoff (same policy as
+				// redacted thinking).
+				if (block.type === "serverToolUse" || block.type === "serverToolResult") {
+					return isSameModel ? block : [];
+				}
+
 				return block;
 			});
 
 			return {
 				...assistantMsg,
-				content: transformedContent,
+				content: transformedContent as AssistantMessage["content"],
 			};
 		}
 		return msg;

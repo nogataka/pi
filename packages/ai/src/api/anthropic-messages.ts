@@ -19,6 +19,8 @@ import type {
 	Model,
 	ProviderEnv,
 	ProviderHeaders,
+	ServerToolResult,
+	ServerToolUse,
 	SimpleStreamOptions,
 	StopReason,
 	StreamFunction,
@@ -540,8 +542,18 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
-			const blocks = output.content as Block[];
+			type Block = (
+				| ThinkingContent
+				| TextContent
+				| (ToolCall & { partialJson: string })
+				| (ServerToolUse & { partialJson: string })
+				| ServerToolResult
+			) & { index: number };
+			// Cast to allow ServerToolUse/ServerToolResult blocks that are not part
+			// of the public AssistantMessage content union but must be stored verbatim
+			// for Anthropic multi-turn replay.
+			const contentAny = output.content as Block[];
+			const blocks = contentAny;
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
@@ -564,7 +576,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							text: "",
 							index: event.index,
 						};
-						output.content.push(block);
+						contentAny.push(block);
 						stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "thinking") {
 						const block: Block = {
@@ -573,7 +585,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							thinkingSignature: "",
 							index: event.index,
 						};
-						output.content.push(block);
+						contentAny.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "redacted_thinking") {
 						const block: Block = {
@@ -583,7 +595,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							redacted: true,
 							index: event.index,
 						};
-						output.content.push(block);
+						contentAny.push(block);
 						stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 					} else if (event.content_block.type === "tool_use") {
 						const block: Block = {
@@ -596,8 +608,42 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							partialJson: "",
 							index: event.index,
 						};
-						output.content.push(block);
+						contentAny.push(block);
 						stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+					} else if ((event.content_block as { type: string }).type === "server_tool_use") {
+						const cb = event.content_block as {
+							type: "server_tool_use";
+							id: string;
+							name: string;
+							input: Record<string, unknown>;
+							caller?: unknown;
+						};
+						const block: Block = {
+							type: "serverToolUse",
+							id: cb.id,
+							name: cb.name,
+							arguments: (cb.input as Record<string, unknown>) ?? {},
+							...(cb.caller !== undefined ? { caller: cb.caller } : {}),
+							partialJson: "",
+							index: event.index,
+						};
+						contentAny.push(block);
+					} else if (
+						(event.content_block as { type: string }).type === "web_search_tool_result" ||
+						(event.content_block as { type: string }).type === "code_execution_tool_result"
+					) {
+						const cb = event.content_block as {
+							type: "web_search_tool_result" | "code_execution_tool_result";
+							tool_use_id: string;
+						};
+						const block: Block = {
+							type: "serverToolResult",
+							resultType: cb.type,
+							toolUseId: cb.tool_use_id,
+							raw: event.content_block,
+							index: event.index,
+						};
+						contentAny.push(block);
 					}
 				} else if (event.type === "content_block_delta") {
 					if (event.delta.type === "text_delta") {
@@ -636,6 +682,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 								delta: event.delta.partial_json,
 								partial: output,
 							});
+						} else if (block && block.type === "serverToolUse") {
+							block.partialJson += event.delta.partial_json;
+							block.arguments = parseStreamingJson(block.partialJson) as Record<string, unknown>;
 						}
 					} else if (event.delta.type === "signature_delta") {
 						const index = blocks.findIndex((b) => b.index === event.index);
@@ -675,6 +724,14 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 								toolCall: block,
 								partial: output,
 							});
+						} else if (block.type === "serverToolUse") {
+							// Only override arguments from streaming JSON if deltas were received.
+							// When input was pre-filled in content_block_start, partialJson is ""
+							// and we must keep the already-set arguments.
+							if (block.partialJson) {
+								block.arguments = parseStreamingJson(block.partialJson) as Record<string, unknown>;
+							}
+							delete (block as { partialJson?: string }).partialJson;
 						}
 					}
 				} else if (event.type === "message_delta") {
@@ -1064,12 +1121,15 @@ function convertMessages(
 		} else if (msg.role === "assistant") {
 			const blocks: ContentBlockParam[] = [];
 
-			for (const block of msg.content) {
+			// Cast to allow provider-specific runtime blocks (serverToolUse / serverToolResult)
+			// that are stored on content but not part of the public union type.
+			for (const rawBlock of msg.content as unknown[]) {
+				const block = rawBlock as TextContent | ThinkingContent | ToolCall | ServerToolUse | ServerToolResult;
 				if (block.type === "text") {
-					if (block.text.trim().length === 0) continue;
+					if ((block as TextContent).text.trim().length === 0) continue;
 					blocks.push({
 						type: "text",
-						text: sanitizeSurrogates(block.text),
+						text: sanitizeSurrogates((block as TextContent).text),
 					});
 				} else if (block.type === "thinking") {
 					// Redacted thinking: pass the opaque payload back as redacted_thinking
@@ -1111,6 +1171,16 @@ function convertMessages(
 						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
 						input: block.arguments ?? {},
 					});
+				} else if (block.type === "serverToolUse") {
+					blocks.push({
+						type: "server_tool_use",
+						id: block.id,
+						name: block.name,
+						input: block.arguments ?? {},
+						...(block.caller !== undefined ? { caller: block.caller } : {}),
+					} as any);
+				} else if (block.type === "serverToolResult") {
+					blocks.push(block.raw as ContentBlockParam);
 				}
 			}
 			if (blocks.length === 0) continue;
